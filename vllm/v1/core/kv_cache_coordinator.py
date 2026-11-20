@@ -280,6 +280,8 @@ class KVCacheCoordinator(ABC):
         num_external_computed_tokens: int,
         num_tokens_main_model: int,
         skip_zeroing_group_ids: tuple[int, ...] = (),
+        load_positions: tuple[tuple[int, ...], ...] | None = None,
+        join_positions: tuple[tuple[int, ...], ...] | None = None,
     ) -> None:
         """Add the new computed blocks to the request. Optionally allocate new
             blocks for external computed tokens (if any).
@@ -293,6 +295,8 @@ class KVCacheCoordinator(ABC):
             num_tokens_main_model: The target-token end of this step.
             skip_zeroing_group_ids: Groups whose external-token blocks are
                 written by an async load and must not be zeroed.
+            load_positions: Connector-selected holes in the full logical rows.
+            join_positions: Connector-selected existing GPU targets in flight.
 
         """
         # A running request is already tracked in num_cached_block and won't
@@ -315,7 +319,23 @@ class KVCacheCoordinator(ABC):
                 num_local_computed_tokens,
                 num_external_computed_tokens,
             )
-        if num_external_computed_tokens > 0:
+        if load_positions is not None or join_positions is not None:
+            for i, manager in enumerate(self.single_type_managers):
+                loads = load_positions[i] if load_positions is not None else ()
+                joins = join_positions[i] if join_positions is not None else ()
+                pending = loads + joins
+                if not pending:
+                    continue
+                row = manager.req_to_blocks[request_id]
+                assert all(row[position].is_null for position in loads)
+                assert all(not row[position].is_null for position in joins)
+                targets = manager.block_pool.get_new_blocks(len(loads))
+                for position, target in zip(loads, targets):
+                    row[position] = target
+                # Leave new pages unpublished until the completed load is
+                # processed. READY pages after a hole retain their hashes.
+                manager.num_cached_block[request_id] = min(pending)
+        elif num_external_computed_tokens > 0:
             for i, manager in enumerate(self.single_type_managers):
                 manager.allocate_external_computed_blocks(
                     request_id,

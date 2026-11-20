@@ -546,6 +546,41 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def try_joint_prefix_match(
+        self, request: "Request", max_cache_hit_length: int | None
+    ) -> tuple["KVCacheBlocks", int] | None:
+        """Optionally select device and external pages in a single match."""
+        return None
+
+    def publish_computed_gpu_blocks(
+        self, request: "Request", num_committed_tokens: int
+    ) -> None:
+        """Publish only the device prefix backed by successful worker output."""
+        return
+
+    def prepare_scheduler_output(
+        self, output: KVConnectorOutput | None
+    ) -> KVConnectorOutput | None:
+        """Resolve receive dependencies and pending local completions."""
+        return output
+
+    @property
+    def supports_device_reclaim(self) -> bool:
+        """Whether the connector holds GPU cache references it can reclaim."""
+        return False
+
+    def reclaim_gpu_cache(
+        self,
+        request: "Request",
+        required_free: int,
+        protected_block_ids: set[int],
+        *,
+        phase: str,
+        attempt: int,
+    ) -> Callable[[bool], None] | None:
+        """Reclaim idle cache references and optionally observe the retry."""
+        return None
+
     def get_loaded_kv_cache_group_ids(self, request: "Request") -> tuple[int, ...]:
         """KV cache groups restored by this connector's load for `request`.
 

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -51,6 +51,12 @@ class KVCacheBlocks:
     - an empty tuple for requests without KVCacheBlock
       (a precomputed KVCacheBlocks is in KVCacheManager to avoid GC overhead)
     """
+
+    # Optional logical positions requiring new GPU destinations. Null entries
+    # absent from these positions are window padding and remain unallocated.
+    load_positions: tuple[tuple[int, ...], ...] | None = None
+    # Existing GPU destinations that are still being written by a shared load.
+    join_positions: tuple[tuple[int, ...], ...] | None = None
 
     def __add__(self, other: "KVCacheBlocks") -> "KVCacheBlocks":
         """Adds two KVCacheBlocks instances."""
@@ -411,6 +417,7 @@ class KVCacheManager:
         reserved_blocks: int = 0,
         has_scheduled_reqs: bool = True,
         skip_zeroing_group_ids: tuple[int, ...] = (),
+        report_device_shortage: Callable[[int], None] | None = None,
     ) -> KVCacheBlocks | None:
         """Add slots for a request with new tokens to append.
 
@@ -445,6 +452,8 @@ class KVCacheManager:
                 this step, controls whether watermark is applied.
             skip_zeroing_group_ids: Groups whose external-token blocks will be
                 written by an async load and must not be zeroed concurrently.
+            report_device_shortage: Receive the total physical free-page
+                target if a capacity gate rejects this allocation.
 
         Blocks layout:
         ```
@@ -510,6 +519,17 @@ class KVCacheManager:
                 "computed tokens to adopt"
             )
 
+        load_positions = (
+            new_computed_blocks.load_positions
+            if new_computed_blocks is not None
+            else None
+        )
+        join_positions = (
+            new_computed_blocks.join_positions
+            if new_computed_blocks is not None
+            else None
+        )
+        num_load_blocks = sum(map(len, load_positions)) if load_positions else 0
         if new_computed_blocks is not None:
             new_computed_block_list = new_computed_blocks.blocks
             if self.retained_hit_group_ids:
@@ -563,8 +583,10 @@ class KVCacheManager:
                 apply_admission_cap=True,
                 prefill_end=prefill_end,
             )
-            required_blocks = num_blocks_to_allocate + watermark_blocks
+            required_blocks = num_blocks_to_allocate + num_load_blocks + watermark_blocks
             if required_blocks > self.block_pool.get_num_free_blocks():
+                if report_device_shortage is not None:
+                    report_device_shortage(required_blocks)
                 return None
 
         num_tokens_main_model = total_computed_tokens + num_new_tokens
@@ -602,9 +624,16 @@ class KVCacheManager:
         # Keep `reserved_blocks` free for other in-flight sequences, and an
         # additional watermark of headroom for waiting/preempted admissions.
         available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
-        required_blocks = num_blocks_to_allocate + watermark_blocks
-        if required_blocks > available_blocks:
+        required_blocks = num_blocks_to_allocate + num_load_blocks + watermark_blocks
+        shares_without_allocation = (
+            join_positions is not None
+            and num_new_tokens == 0
+            and num_blocks_to_allocate + num_load_blocks == 0
+        )
+        if required_blocks > available_blocks and not shares_without_allocation:
             # Cannot allocate new blocks
+            if report_device_shortage is not None:
+                report_device_shortage(required_blocks + reserved_blocks)
             return None
 
         if (
@@ -620,6 +649,8 @@ class KVCacheManager:
                 num_external_computed_tokens=num_external_computed_tokens,
                 num_tokens_main_model=num_tokens_main_model,
                 skip_zeroing_group_ids=skip_zeroing_group_ids,
+                load_positions=load_positions,
+                join_positions=join_positions,
             )
 
         new_blocks = self.coordinator.allocate_new_blocks(

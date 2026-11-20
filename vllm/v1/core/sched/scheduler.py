@@ -678,15 +678,68 @@ class Scheduler(SchedulerInterface):
         self, request: Request, max_cache_hit_length: int | None = None
     ) -> tuple[KVCacheBlocks, int, int, bool]:
         connector = self.connector
-        if connector is not None and connector.supports_divergent_local_hybrid_hits:
-            return self.kv_cache_manager.get_computed_blocks_for_connector(
+        if connector is not None:
+            if match := connector.try_joint_prefix_match(
                 request, max_cache_hit_length
-            )
+            ):
+                blocks, num_local = match
+                return blocks, num_local, 0, False
+            if connector.supports_divergent_local_hybrid_hits:
+                return self.kv_cache_manager.get_computed_blocks_for_connector(
+                    request, max_cache_hit_length
+                )
 
         blocks, num_local, shared_prefix_boundary = (
             self.kv_cache_manager.get_computed_blocks(request, max_cache_hit_length)
         )
         return blocks, num_local, shared_prefix_boundary, False
+
+    def _allocate_slots_with_reclaim(
+        self, request: Request, num_new_tokens: int, *, phase: str, **options: Any
+    ) -> KVCacheBlocks | None:
+        connector = self.connector
+        allocate = self.kv_cache_manager.allocate_slots
+        if connector is None or not connector.supports_device_reclaim:
+            return allocate(request, num_new_tokens, **options)
+
+        pool = self.kv_cache_manager.block_pool
+        ready = options.get("new_computed_blocks")
+        protected = (
+            {
+                block.block_id
+                for row in ready.blocks
+                for block in row
+                if not block.is_null
+            }
+            if ready is not None
+            else set()
+        )
+        observer = None
+        for attempt in itertools.count(1):
+            shortage: list[int] = []
+            blocks = allocate(
+                request,
+                num_new_tokens,
+                report_device_shortage=shortage.append,
+                **options,
+            )
+            if observer is not None:
+                observer(blocks is not None)
+            if blocks is not None or not shortage:
+                return blocks
+            required_free = shortage[0]
+            if required_free >= pool.num_gpu_blocks:
+                # Includes semantic admission sentinels, such as a Mamba state
+                # produced in the same step. Reclaim cannot satisfy these.
+                return None
+            free_before = pool.get_num_free_blocks()
+            observer = connector.reclaim_gpu_cache(
+                request, required_free, protected, phase=phase, attempt=attempt
+            )
+            if pool.get_num_free_blocks() <= free_before:
+                if observer is not None:
+                    observer(False)
+                return None
 
     def _reserve_prefill_lookahead(
         self,
@@ -906,9 +959,10 @@ class Scheduler(SchedulerInterface):
             # Schedule newly needed KV blocks for the request.
             with record_function_or_nullcontext("schedule: allocate_slots"):
                 while True:
-                    new_blocks = self.kv_cache_manager.allocate_slots(
+                    new_blocks = self._allocate_slots_with_reclaim(
                         request,
                         num_new_tokens,
+                        phase="running",
                         num_lookahead_tokens=self.num_lookahead_tokens,
                     )
 
@@ -1496,9 +1550,10 @@ class Scheduler(SchedulerInterface):
                 # Replayed tokens are already counted in the adopted hit; a
                 # chunk that ends inside the replayed range needs no new slots.
                 num_tokens_past_hit = max(num_new_tokens - num_replay_tokens, 0)
-                new_blocks = self.kv_cache_manager.allocate_slots(
+                new_blocks = self._allocate_slots_with_reclaim(
                     request,
                     num_tokens_past_hit,
+                    phase="waiting",
                     num_new_computed_tokens=num_new_local_computed_tokens,
                     new_computed_blocks=new_computed_blocks,
                     num_lookahead_tokens=effective_lookahead_tokens,
@@ -2336,6 +2391,10 @@ class Scheduler(SchedulerInterface):
         self._emit_dropped_streaming_updates(outputs)
         spec_decoding_stats: SpecDecodingStats | None = None
 
+        if self.connector is not None:
+            kv_connector_output = self.connector.prepare_scheduler_output(
+                kv_connector_output
+            )
         failed_kv_load_req_ids: set[str] = set()
         if kv_connector_output and kv_connector_output.failed_recving:
             failed_kv_load_req_ids.update(
@@ -2512,6 +2571,11 @@ class Scheduler(SchedulerInterface):
                 request.status = RequestStatus.FINISHED_ERROR
                 request.resumable = False
                 stopped = True
+
+            if self.connector is not None and not output_is_stale:
+                self.connector.publish_computed_gpu_blocks(
+                    request, request.num_computed_tokens - request.num_in_flight_tokens
+                )
 
             routed_experts = None
             should_emit_output = bool(
@@ -3676,6 +3740,9 @@ class Scheduler(SchedulerInterface):
             # Now that the blocks are ready, actually cache them.
             # This will cache the blocks iff caching is enabled.
             self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
+            self.connector.publish_computed_gpu_blocks(
+                request, request.num_computed_tokens
+            )
 
         # DSV41 SWA bounded replay recomputes the tail of a hit loaded without
         # its window, or of a failed load, which may have lost it; the replay

@@ -171,6 +171,8 @@ class BlockPool:
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
+        self.on_cached_block_invalidated: Callable[[int], None] | None = None
+        self.prepare_prefix_cache_reset: Callable[[], None] | None = None
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -260,7 +262,10 @@ class BlockPool:
 
             # Update and added the full block to the cache.
             block_hash_with_group_id = BlockHashWithGroupId(block_hash + group_suffix)
-            if blk.block_hash is not None:
+            if (
+                blk.block_hash is not None
+                and blk.block_hash != block_hash_with_group_id
+            ):
                 # The only valid case where a "new full block" already has a
                 # hash is partial->full promotion of the same cache block.
                 assert (
@@ -609,6 +614,8 @@ class BlockPool:
         # A block only has secondary hashes alongside a primary one.
         if block.block_hash is None:
             return []
+        if self.on_cached_block_invalidated is not None:
+            self.on_cached_block_invalidated(block.block_id)
 
         block_hashes = [block.block_hash]
         block_hashes.extend(self.cached_block_hashes_by_block.pop(block.block_id, ()))
@@ -868,6 +875,8 @@ class BlockPool:
             False otherwise.
 
         """
+        if self.prepare_prefix_cache_reset is not None:
+            self.prepare_prefix_cache_reset()
         num_used_blocks = self.num_gpu_blocks - self.get_num_free_blocks()
         if num_used_blocks != 1:  # The null block is always marked as used
             logger.warning(
@@ -888,6 +897,11 @@ class BlockPool:
 
         # Remove all hashes from all blocks.
         for block in self.blocks:
+            if (
+                block.block_hash is not None
+                and self.on_cached_block_invalidated is not None
+            ):
+                self.on_cached_block_invalidated(block.block_id)
             block.reset_hash()
 
         if self.metrics_collector:
